@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 
@@ -24,6 +25,9 @@ COL_DAYS = 9
 COL_LOTS = 10
 COL_QTD_DAYS = 11
 COL_QTD_LOTS = 12
+
+DEBUG_SCREENSHOT = "debug_rba_page.png"
+DEBUG_HTML = "debug_rba_page.html"
 
 
 @dataclass
@@ -82,53 +86,182 @@ def parse_lots(text: str) -> Optional[int]:
     return int(match.group(1).replace(",", ""))
 
 
+def save_debug(page) -> None:
+    try:
+        page.screenshot(path=DEBUG_SCREENSHOT, full_page=True)
+    except Exception:
+        pass
+
+    try:
+        html = page.content()
+        Path(DEBUG_HTML).write_text(html, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def dismiss_cookie_or_overlay(page) -> None:
+    candidate_selectors = [
+        'button:has-text("Accept")',
+        'button:has-text("I Accept")',
+        'button:has-text("Accept All")',
+        'button:has-text("Allow All")',
+        '[id*="accept"]',
+        '[class*="accept"]',
+    ]
+
+    for selector in candidate_selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.is_visible(timeout=1000):
+                loc.click(timeout=1000)
+                page.wait_for_timeout(1000)
+                return
+        except Exception:
+            continue
+
+
+def open_past_tab(page) -> None:
+    selectors = [
+        '[data-testid="sold-upcoming-toggle-past"]',
+        'button[aria-label="Past"]',
+        'button[value="past"]',
+        'button:has-text("Past")',
+        'text=Past',
+    ]
+
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            loc.wait_for(state="visible", timeout=5000)
+            loc.click(timeout=5000)
+            page.wait_for_timeout(2500)
+            return
+        except Exception:
+            continue
+
+    title = ""
+    snippet = ""
+    try:
+        title = page.title()
+    except Exception:
+        pass
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=2000)
+        snippet = body_text[:1200]
+    except Exception:
+        pass
+
+    save_debug(page)
+    raise RuntimeError(
+        "Could not find/click the Past tab. "
+        f"Page title seen by GitHub Actions: {title!r}. "
+        f"Body starts with: {snippet!r}. "
+        f"Saved debug files: {DEBUG_SCREENSHOT}, {DEBUG_HTML}"
+    )
+
+
 def scrape_auctions() -> List[AuctionRecord]:
     records: List[AuctionRecord] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
 
-        page.goto(AUCTION_URL, wait_until="networkidle")
-        page.wait_for_timeout(5000)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            viewport={"width": 1440, "height": 2200},
+        )
 
-        page.locator('[data-testid="sold-upcoming-toggle-past"]').click()
-        page.wait_for_timeout(4000)
+        page = context.new_page()
+        page.goto(AUCTION_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(6000)
 
-        cards = page.locator('[data-testid^="auction-card-"]')
-        card_count = cards.count()
+        dismiss_cookie_or_overlay(page)
+        open_past_tab(page)
+
+        card_selectors = [
+            '[data-testid^="auction-card-"]',
+            'a[href*="/heavy-equipment-auctions/"]',
+        ]
+
+        cards = None
+        card_count = 0
+
+        for selector in card_selectors:
+            try:
+                cards = page.locator(selector)
+                card_count = cards.count()
+                if card_count > 0:
+                    break
+            except Exception:
+                continue
+
+        if not cards or card_count == 0:
+            save_debug(page)
+            raise RuntimeError(
+                f"No auction cards found after opening Past tab. "
+                f"Saved debug files: {DEBUG_SCREENSHOT}, {DEBUG_HTML}"
+            )
 
         for i in range(card_count):
             card = cards.nth(i)
 
             try:
-                date_text = card.locator('[data-testid^="auction-card-date-range-"]').first.inner_text().strip()
-                auction_name = card.locator("h5").first.inner_text().strip()
-                lots_text = card.locator('[data-testid^="auction-card-item-count-"]').first.inner_text().strip()
+                text = card.inner_text(timeout=2000)
             except Exception:
                 continue
 
-            lots = parse_lots(lots_text)
-            if lots is None:
+            date_match = re.search(
+                r"([A-Z][a-z]{2}\s\d{1,2}(?:\s-\s(?:[A-Z][a-z]{2}\s)?\d{1,2})?)",
+                text,
+            )
+            lots = parse_lots(text)
+
+            if not date_match or lots is None:
                 continue
 
-            try:
-                location_text = card.locator('[data-testid^="auction-card-site-count-"]').first.inner_text().strip()
-            except Exception:
-                location_text = ""
+            auction_name = ""
+            location_text = ""
+            href = None
 
             try:
-                href = card.locator("xpath=ancestor::a[1]").get_attribute("href")
+                auction_name = card.locator("h5").first.inner_text(timeout=1000).strip()
+            except Exception:
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                if len(lines) >= 2:
+                    auction_name = lines[1]
+
+            try:
+                href = card.get_attribute("href")
             except Exception:
                 href = None
 
+            if not auction_name:
+                continue
+
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if len(lines) >= 5:
+                location_text = lines[-1]
+
             records.append(
                 AuctionRecord(
-                    auction_date_text=date_text,
+                    auction_date_text=date_match.group(1),
                     auction_name=auction_name,
                     location_text=location_text,
                     lots=lots,
-                    days=parse_days(date_text),
+                    days=parse_days(date_match.group(1)),
                     source_url=href,
                 )
             )
@@ -167,10 +300,8 @@ class AuctionWorkbookUpdater:
 
     def next_row(self):
         row = START_DATA_ROW
-
         while self.ws.cell(row=row, column=COL_AUCTION).value:
             row += 1
-
         return row
 
     def copy_formula(self, row: int, col: int):
@@ -178,7 +309,6 @@ class AuctionWorkbookUpdater:
             return
 
         src = self.ws.cell(row=row - 1, column=col)
-
         if isinstance(src.value, str) and src.value.startswith("="):
             self.ws.cell(row=row, column=col).value = src.value
 
@@ -188,7 +318,6 @@ class AuctionWorkbookUpdater:
 
         for record in sorted(records, key=lambda r: (r.parsed_date, r.auction_name)):
             key = (record.parsed_date.strftime("%Y-%m-%d"), record.auction_name.lower())
-
             if key in existing:
                 continue
 
