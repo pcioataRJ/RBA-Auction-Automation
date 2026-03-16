@@ -1,88 +1,180 @@
 import re
-            return nums[-1] - nums[0] + 1
-        return 1
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from playwright.sync_api import sync_playwright
+
+AUCTION_URL = "https://www.rbauction.com/heavy-equipment-auctions"
+WORKBOOK_PATH = Path("Copy of RBA Auction Data V2.xlsx")
+WORKSHEET_NAME = "Quarter Summaries"
+START_DATA_ROW = 6
+
+COL_YEAR = 2
+COL_MONTH = 3
+COL_TAG = 4
+COL_DATE = 5
+COL_FORMULA_F = 6
+COL_AUCTION = 8
+COL_DAYS = 9
+COL_LOTS = 10
+COL_QTD_DAYS = 11
+COL_QTD_LOTS = 12
+
+
+@dataclass
+class AuctionRecord:
+    auction_date_text: str
+    auction_name: str
+    location_text: str
+    lots: int
+    days: int
+
+    @property
+    def parsed_date(self):
+        year = datetime.today().year
+        month, day = re.findall(r"([A-Z][a-z]{2}) (\d{1,2})", self.auction_date_text)[0]
+        return datetime.strptime(f"{month} {day} {year}", "%b %d %Y")
+
+    @property
+    def month_num(self):
+        return self.parsed_date.month
+
+    @property
+    def tag_value(self):
+        return f"{self.month_num}-{str(self.parsed_date.year)[-2:]}"
+
+
+def scrape_auctions():
+
+    records = []
+
+    with sync_playwright() as p:
+
+        browser = p.chromium.launch()
+        page = browser.new_page()
+
+        page.goto(AUCTION_URL)
+
+        page.get_by_text("Past").click()
+
+        page.wait_for_timeout(3000)
+
+        cards = page.locator("h5")
+        count = cards.count()
+
+        for i in range(count):
+
+            name = cards.nth(i).inner_text()
+
+            card = cards.nth(i).locator("xpath=ancestor::a")
+
+            text = card.inner_text()
+
+            date = re.search(r"[A-Z][a-z]{2} \d{1,2}", text)
+
+            lots = re.search(r"(\d{1,3}(,\d{3})*) Items", text)
+
+            if not date or not lots:
+                continue
+
+            records.append(
+                AuctionRecord(
+                    auction_date_text=date.group(),
+                    auction_name=name,
+                    location_text="",
+                    lots=int(lots.group(1).replace(",", "")),
+                    days=1,
+                )
+            )
+
+        browser.close()
+
+    return records
 
 
 class AuctionWorkbookUpdater:
-    def __init__(self, workbook_path: Path, worksheet_name: str):
-        self.workbook_path = workbook_path
-        self.worksheet_name = worksheet_name
 
-    def update(self, records: List[AuctionRecord]) -> int:
-        wb = load_workbook(self.workbook_path)
-        ws = wb[self.worksheet_name]
+    def __init__(self):
+        self.wb = load_workbook(WORKBOOK_PATH)
+        self.ws = self.wb[WORKSHEET_NAME]
 
-        existing = self._existing_keys(ws)
-        rows_added = 0
+    def existing_keys(self):
 
-        for record in sorted(records, key=lambda r: (r.parsed_date, r.auction_name)):
-            key = self._record_key(record)
+        keys = set()
+
+        for row in range(START_DATA_ROW, self.ws.max_row + 1):
+
+            date = self.ws.cell(row=row, column=COL_DATE).value
+            name = self.ws.cell(row=row, column=COL_AUCTION).value
+
+            if date and name:
+                keys.add((str(date), name.lower()))
+
+        return keys
+
+    def next_row(self):
+
+        row = START_DATA_ROW
+
+        while self.ws.cell(row=row, column=COL_AUCTION).value:
+            row += 1
+
+        return row
+
+    def copy_formula(self, row, col):
+
+        src = self.ws.cell(row=row - 1, column=col)
+
+        if isinstance(src.value, str) and src.value.startswith("="):
+            self.ws.cell(row=row, column=col).value = src.value
+
+    def update(self, records):
+
+        existing = self.existing_keys()
+
+        added = 0
+
+        for r in records:
+
+            key = (str(r.parsed_date), r.auction_name.lower())
+
             if key in existing:
                 continue
 
-            row = self._next_empty_row(ws)
-            ws.cell(row=row, column=COL_YEAR).value = record.parsed_date.year
-            ws.cell(row=row, column=COL_MONTH).value = record.month_num
-            ws.cell(row=row, column=COL_TAG).value = record.tag_value
-            ws.cell(row=row, column=COL_DATE).value = record.date_for_excel
-            ws.cell(row=row, column=COL_AUCTION).value = record.auction_name
-            ws.cell(row=row, column=COL_DAYS).value = record.days
-            ws.cell(row=row, column=COL_LOTS).value = record.lots
+            row = self.next_row()
 
-            self._copy_formula_down(ws, row, COL_FORMULA_F)
-            self._copy_formula_down(ws, row, COL_QTD_DAYS)
-            self._copy_formula_down(ws, row, COL_QTD_LOTS)
+            self.ws.cell(row=row, column=COL_YEAR).value = r.parsed_date.year
+            self.ws.cell(row=row, column=COL_MONTH).value = r.month_num
+            self.ws.cell(row=row, column=COL_TAG).value = r.tag_value
+            self.ws.cell(row=row, column=COL_DATE).value = r.parsed_date
+            self.ws.cell(row=row, column=COL_AUCTION).value = r.auction_name
+            self.ws.cell(row=row, column=COL_DAYS).value = r.days
+            self.ws.cell(row=row, column=COL_LOTS).value = r.lots
 
-            fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
-            for col in range(COL_YEAR, COL_QTD_LOTS + 1):
-                ws.cell(row=row, column=col).fill = fill
+            self.copy_formula(row, COL_FORMULA_F)
+            self.copy_formula(row, COL_QTD_DAYS)
+            self.copy_formula(row, COL_QTD_LOTS)
 
-            existing.add(key)
-            rows_added += 1
+            added += 1
 
-        wb.save(self.workbook_path)
-        return rows_added
+        self.wb.save(WORKBOOK_PATH)
 
-    def _existing_keys(self, ws):
-        keys = set()
-        for row in range(START_DATA_ROW, ws.max_row + 1):
-            date_val = ws.cell(row=row, column=COL_DATE).value
-            name_val = ws.cell(row=row, column=COL_AUCTION).value
-            if date_val and name_val:
-                if isinstance(date_val, datetime):
-                    date_key = date_val.strftime("%Y-%m-%d")
-                else:
-                    date_key = str(date_val)
-                keys.add((date_key.strip(), str(name_val).strip().lower()))
-        return keys
-
-    def _record_key(self, record: AuctionRecord):
-        return (record.parsed_date.strftime("%Y-%m-%d"), record.auction_name.strip().lower())
-
-    def _next_empty_row(self, ws) -> int:
-        row = START_DATA_ROW
-        while ws.cell(row=row, column=COL_AUCTION).value:
-            row += 1
-        return row
-
-    def _copy_formula_down(self, ws, row: int, col: int):
-        if row <= START_DATA_ROW:
-            return
-        source = ws.cell(row=row - 1, column=col)
-        target = ws.cell(row=row, column=col)
-        if isinstance(source.value, str) and source.value.startswith("="):
-            target.value = source.value
+        return added
 
 
 def main():
-    scraper = RBAuctionScraper(headless=True)
-    updater = AuctionWorkbookUpdater(WORKBOOK_PATH, WORKSHEET_NAME)
 
-    records = scraper.scrape_past_auctions()
-    print(f"Scraped {len(records)} past auctions")
+    records = scrape_auctions()
 
-    rows_added = updater.update(records)
-    print(f"Added {rows_added} new rows to workbook: {WORKBOOK_PATH}")
+    updater = AuctionWorkbookUpdater()
+
+    added = updater.update(records)
+
+    print("Rows added:", added)
 
 
 if __name__ == "__main__":
