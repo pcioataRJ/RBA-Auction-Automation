@@ -3,7 +3,7 @@ name: Update auction workbook
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 10 * * 1'
+    - cron: '0 14 * * 1'
 
 permissions:
   contents: write
@@ -30,13 +30,25 @@ jobs:
       - name: Run updater
         run: python update_auction_data.py
 
+      - name: Upload debug files if present
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-files
+          path: |
+            debug_rba_page.png
+            debug_rba_page.html
+          if-no-files-found: ignore
+
       - name: Upload updated workbook
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: updated-auction-workbook
           path: Copy of RBA Auction Data V2.xlsx
 
       - name: Commit updated workbook
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
